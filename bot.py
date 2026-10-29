@@ -2,10 +2,12 @@ import asyncio, html, json, mimetypes, os, re, time
 import httpx
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon import utils
+from telethon.tl import types as tl
 from telethon.tl.types import (DocumentAttributeSticker, DocumentAttributeAnimated,
                                InputStickerSetEmpty)
 from telethon.errors import (SessionPasswordNeededError, PhoneCodeInvalidError,
-                             PhoneCodeExpiredError, PasswordHashInvalidError)
+                             PhoneCodeExpiredError, PasswordHashInvalidError, FloodWaitError)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -87,7 +89,8 @@ async def api(method, **p):
         r = await http.post(f"{BASE}/{method}", json=p)
         j = r.json()
         if not j.get("ok"):
-            print(method, j.get("description"))
+            if "not modified" not in str(j.get("description")):
+                print(method, j.get("description"))
             return None
         return j["result"]
     except Exception as e:
@@ -191,37 +194,59 @@ temp = None
 me_id = 0
 state = {}          # uid -> {"step": ...}
 
+media_cache = None            # media ek baar upload hoke yahan cache hota hai (rate-limit se bachne ke liye)
+send_lock = asyncio.Lock()    # replies ek ek karke jayenge
+SPOILER_KINDS = ("photo", "video", "animation")
+
+def media_args(m):
+    kind = m["kind"]
+    kw, attrs = {}, None
+    if kind == "voice":
+        kw["voice_note"] = True
+    elif kind == "video_note":
+        kw["video_note"] = True
+    elif kind == "document":
+        kw["force_document"] = True
+    elif kind == "sticker":
+        attrs = [DocumentAttributeSticker(alt=m.get("emoji") or "🙂",
+                                          stickerset=InputStickerSetEmpty())]
+    elif kind == "animation":
+        attrs = [DocumentAttributeAnimated()]
+    elif kind == "video":
+        kw["supports_streaming"] = True
+    return kw, attrs
+
+async def build_media_cache(m):
+    """Media ko Saved Messages me ek baar upload karo, phir sirf reference reuse hota hai."""
+    kw, attrs = media_args(m)
+    msg = await user.send_file("me", m["path"], attributes=attrs, **kw)
+    sp = m["kind"] in SPOILER_KINDS
+    med = msg.media
+    if getattr(med, "photo", None):
+        return tl.InputMediaPhoto(id=utils.get_input_photo(med.photo), spoiler=sp)
+    return tl.InputMediaDocument(id=utils.get_input_document(med.document), spoiler=sp)
+
 async def send_reply(event, name):
+    global media_cache
     text = data["message"].replace("{name}", html.escape(name))
     m = data.get("media")
     sent = []
     if m and os.path.exists(m["path"]):
-        kind = m["kind"]
-        kw = {}
-        attrs = None
-        if kind == "voice":
-            kw["voice_note"] = True
-        elif kind == "video_note":
-            kw["video_note"] = True
-        elif kind == "document":
-            kw["force_document"] = True
-        elif kind == "sticker":
-            attrs = [DocumentAttributeSticker(alt=m.get("emoji") or "🙂",
-                                              stickerset=InputStickerSetEmpty())]
-        elif kind == "animation":
-            attrs = [DocumentAttributeAnimated()]
-        elif kind == "video":
-            kw["supports_streaming"] = True
-        no_caption = kind in ("sticker", "video_note")
+        no_caption = m["kind"] in ("sticker", "video_note")
         cap = None if no_caption or not text.strip() else text
-        args = dict(reply_to=event.id, caption=cap, parse_mode="html", attributes=attrs, **kw)
-        if kind in ("photo", "video", "animation"):       # photo/video user ko hide (spoiler) me
-            try:
-                msg = await user.send_file(event.chat_id, m["path"], spoiler=True, **args)
-            except TypeError:
-                msg = await user.send_file(event.chat_id, m["path"], **args)
-        else:
-            msg = await user.send_file(event.chat_id, m["path"], **args)
+        args = dict(reply_to=event.id, caption=cap, parse_mode="html")
+        if media_cache is None:
+            media_cache = await build_media_cache(m)
+        try:
+            msg = await user.send_file(event.chat_id, media_cache, **args)
+        except FloodWaitError:
+            raise
+        except Exception as e:
+            if "too many" in str(e).lower():
+                raise
+            print("media cache rebuild:", e)           # file reference expire hua to dobara banao
+            media_cache = await build_media_cache(m)
+            msg = await user.send_file(event.chat_id, media_cache, **args)
         sent.append(msg)
         if no_caption and text.strip():
             sent.append(await user.send_message(event.chat_id, text, parse_mode="html"))
@@ -251,9 +276,13 @@ async def auto_reply(event):
     if now - data["replied"].get(str(sid), 0) < data["cooldown"] * 3600:
         return
     try:
-        await send_reply(event, name)
+        async with send_lock:
+            await send_reply(event, name)
+            await asyncio.sleep(1.5)         # thoda gap, taaki Telegram rate-limit na kare
         data["replied"][str(sid)] = now      # sirf success hone par cooldown lagta hai
         save()
+    except FloodWaitError as e:
+        print(f"flood wait {e.seconds}s - is user ko baad me reply milega:", sid)
     except Exception as e:
         print("reply error:", sid, e)
 
@@ -263,16 +292,24 @@ async def cleaner():
         await asyncio.sleep(15)
         if not user or not data["pending"]:
             continue
+        try:
+            if not user.is_connected():
+                await user.connect()
+        except Exception as e:
+            print("reconnect error:", e)
+            continue
         now = time.time()
         keep = []
         for chat, mid, due in data["pending"]:
-            if due <= now:
-                try:
-                    await user.delete_messages(chat, [mid], revoke=True)
-                except Exception as e:
-                    print("delete error:", e)
-            else:
+            if due > now:
                 keep.append([chat, mid, due])
+                continue
+            try:
+                await user.delete_messages(chat, [mid], revoke=True)
+            except Exception as e:
+                print("delete error:", e)
+                if now - due < 3600:             # 1 ghante tak dobara try
+                    keep.append([chat, mid, due])
         data["pending"] = keep
         save()
 
@@ -403,6 +440,8 @@ async def send_preview(uid):
     asyncio.create_task(later())
 
 async def set_reply(m):
+    global media_cache
+    media_cache = None
     kind = None
     obj = None
     for k in ("photo", "animation", "video", "sticker", "voice", "audio", "video_note", "document"):
