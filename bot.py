@@ -12,6 +12,7 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 BRAND = os.getenv("BRAND", "Miss Chutki")
+OWNER_CONTACT = "https://t.me/NXC_OWNERJI"
 
 AUTO_DELETE = 300            # auto-reply 5 minute baad delete (UI me option nahi dikhta)
 DATA_FILE = "data.json"
@@ -24,7 +25,8 @@ os.makedirs("media", exist_ok=True)
 DEFAULT = {"session": "", "enabled": False, "cooldown": 6.0,
            "message": "👋 Hi {name}!\nMain abhi busy hu, jaldi reply karunga. 🙏",
            "plain": "👋 Hi {name}!\nMain abhi busy hu, jaldi reply karunga. 🙏",
-           "media": None, "replied": {}, "pending": [], "menu_id": 0, "start_fid": ""}
+           "media": None, "replied": {}, "pending": [], "menus": {}, "start_fid": "",
+           "admins": []}
 data = dict(DEFAULT)
 if os.path.exists(DATA_FILE):
     data.update(json.load(open(DATA_FILE)))
@@ -32,11 +34,17 @@ if os.path.exists(DATA_FILE):
 def save():
     json.dump(data, open(DATA_FILE, "w"))
 
+def is_owner(uid):
+    return uid == OWNER_ID
+
+def is_admin(uid):
+    return uid == OWNER_ID or uid in data["admins"]
+
 # ---------- small caps font ----------
 _SC = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ")
 
 def sc(text):
-    parts = re.split(r"(<[^>]+>)", text)       # HTML tags ko mat chhedo
+    parts = re.split(r"(<[^>]+>)", text)
     return "".join(p if p.startswith("<") else p.lower().translate(_SC) for p in parts)
 
 # ---------- telegram entities -> html ----------
@@ -94,14 +102,17 @@ def B(label, cb, style=None):
 
 BACK = [[B("⬅️ Back", "home", "primary")]]
 
-def home_kb():
+def home_kb(uid):
     on = data["enabled"]
-    return [
+    kb = [
         [B("🟢 Auto-Reply : ON" if on else "🔴 Auto-Reply : OFF", "toggle", "success" if on else "danger")],
         [B("✏️ Set Reply", "setmsg", "primary"), B("👁 Preview", "preview", "primary")],
         [B("⏱ Cooldown", "cd", "primary"), B("🔄 Refresh", "home", "primary")],
-        [B("🔑 Login", "login", "success"), B("🚪 Logout", "logout", "danger")],
     ]
+    if is_owner(uid):
+        kb.append([B("🔑 Login", "login", "success"), B("🚪 Logout", "logout", "danger")])
+        kb.append([B("👑 Admins", "admins", "primary")])
+    return kb
 
 def home_text():
     acc = "✅ ʟᴏɢɢᴇᴅ ɪɴ" if user else "❌ ɴᴏᴛ ʟᴏɢɢᴇᴅ ɪɴ"
@@ -118,44 +129,67 @@ def home_text():
             f"🎞 {sc('media')} : {media}\n\n"
             f"💬 {sc('message')} :\n<blockquote>{short}</blockquote>")
 
-async def send_menu():
-    if data.get("menu_id"):
-        await api("deleteMessage", chat_id=OWNER_ID, message_id=data["menu_id"])
-    kb = json.dumps({"inline_keyboard": home_kb()})
+def prompt(text):
+    return f"✦ <b>{sc(BRAND)}</b> ✦\n\n{text}"
+
+async def send_card(uid, caption, kb):
+    """Start photo (spoiler) + caption + buttons."""
     r = None
+    markup = {"inline_keyboard": kb}
     if data.get("start_fid"):
-        r = await api("sendPhoto", chat_id=OWNER_ID, photo=data["start_fid"], caption=home_text(),
-                      parse_mode="HTML", has_spoiler=True, reply_markup={"inline_keyboard": home_kb()})
+        r = await api("sendPhoto", chat_id=uid, photo=data["start_fid"], caption=caption,
+                      parse_mode="HTML", has_spoiler=True, reply_markup=markup)
     if not r:
         with open(START_IMG, "rb") as f:
             resp = await http.post(f"{BASE}/sendPhoto",
-                                   data={"chat_id": OWNER_ID, "caption": home_text(), "parse_mode": "HTML",
-                                         "has_spoiler": "true", "reply_markup": kb},
+                                   data={"chat_id": uid, "caption": caption, "parse_mode": "HTML",
+                                         "has_spoiler": "true", "reply_markup": json.dumps(markup)},
                                    files={"photo": f})
         j = resp.json()
         r = j.get("result") if j.get("ok") else None
         if r:
             data["start_fid"] = r["photo"][-1]["file_id"]
-    if r:
-        data["menu_id"] = r["message_id"]
-        save()
-
-async def edit_menu(caption, kb):
-    r = await api("editMessageCaption", chat_id=OWNER_ID, message_id=data["menu_id"],
-                  caption=caption, parse_mode="HTML", reply_markup={"inline_keyboard": kb})
+            save()
     return r
 
-async def edit_home():
-    await edit_menu(home_text(), home_kb())
+async def send_menu(uid):
+    old = data["menus"].get(str(uid))
+    if old:
+        await api("deleteMessage", chat_id=uid, message_id=old)
+    r = await send_card(uid, home_text(), home_kb(uid))
+    if r:
+        data["menus"][str(uid)] = r["message_id"]
+        save()
 
-def prompt(text):
-    return f"✦ <b>{sc(BRAND)}</b> ✦\n\n{text}"
+async def send_unauth(uid):
+    cap = (f"✦ <b>{sc(BRAND)}</b> ✦\n\n🔒 {sc('access denied')}\n"
+           f"{sc('is bot ko use karne ke liye admin hona zaroori hai.')}\n"
+           f"{sc('access ke liye owner se connect karo')} 👇")
+    kb = [[{"text": sc("👑 contact owner"), "url": OWNER_CONTACT, "style": "primary"}]]
+    await send_card(uid, cap, kb)
+
+async def edit_menu(uid, caption, kb):
+    return await api("editMessageCaption", chat_id=uid, message_id=data["menus"].get(str(uid)),
+                     caption=caption, parse_mode="HTML", reply_markup={"inline_keyboard": kb})
+
+async def edit_home(uid):
+    await edit_menu(uid, home_text(), home_kb(uid))
+
+def admins_view():
+    lines = "\n".join(f"• <a href=\"tg://user?id={a}\">{a}</a>" for a in data["admins"]) or f"• {sc('koi admin nahi')}"
+    text = prompt(f"👑 {sc('admins')}\n\n{sc('owner')} : <a href=\"tg://user?id={OWNER_ID}\">{OWNER_ID}</a>\n\n{lines}\n\n"
+                  f"{sc('admin ko login/logout/admin-control nahi milta.')}")
+    kb = [[B("➕ Add Admin", "addadm", "success")]]
+    for a in data["admins"]:
+        kb.append([B(f"❌ Remove {a}", f"rm:{a}", "danger")])
+    kb.append(BACK[0])
+    return text, kb
 
 # ---------- user account (auto reply) ----------
 user = None
 temp = None
 me_id = 0
-state = {}
+state = {}          # uid -> {"step": ...}
 
 async def send_reply(event, name):
     text = data["message"].replace("{name}", html.escape(name))
@@ -179,9 +213,15 @@ async def send_reply(event, name):
         elif kind == "video":
             kw["supports_streaming"] = True
         no_caption = kind in ("sticker", "video_note")
-        msg = await user.send_file(event.chat_id, m["path"], reply_to=event.id,
-                                   caption=None if no_caption or not text.strip() else text,
-                                   parse_mode="html", attributes=attrs, **kw)
+        cap = None if no_caption or not text.strip() else text
+        args = dict(reply_to=event.id, caption=cap, parse_mode="html", attributes=attrs, **kw)
+        if kind in ("photo", "video", "animation"):       # photo/video user ko hide (spoiler) me
+            try:
+                msg = await user.send_file(event.chat_id, m["path"], spoiler=True, **args)
+            except TypeError:
+                msg = await user.send_file(event.chat_id, m["path"], **args)
+        else:
+            msg = await user.send_file(event.chat_id, m["path"], **args)
         sent.append(msg)
         if no_caption and text.strip():
             sent.append(await user.send_message(event.chat_id, text, parse_mode="html"))
@@ -195,18 +235,27 @@ async def send_reply(event, name):
 async def auto_reply(event):
     if not data["enabled"] or not event.is_private or event.out:
         return
-    sender = await event.get_sender()
-    if not sender or getattr(sender, "bot", False) or sender.id in (me_id, 777000):
+    sid = event.sender_id
+    if not sid or sid in (me_id, 777000):
         return
-    now = time.time()
-    if now - data["replied"].get(str(sender.id), 0) < data["cooldown"] * 3600:
-        return
-    data["replied"][str(sender.id)] = now
-    save()
+    name = "dost"
     try:
-        await send_reply(event, (sender.first_name or "").strip() or "dost")
+        sender = await event.get_sender()
+        if sender is not None:
+            if getattr(sender, "bot", False):
+                return
+            name = (getattr(sender, "first_name", "") or "").strip() or "dost"
+    except Exception:
+        pass
+    now = time.time()
+    if now - data["replied"].get(str(sid), 0) < data["cooldown"] * 3600:
+        return
+    try:
+        await send_reply(event, name)
+        data["replied"][str(sid)] = now      # sirf success hone par cooldown lagta hai
+        save()
     except Exception as e:
-        print("reply error:", e)
+        print("reply error:", sid, e)
 
 async def cleaner():
     """5 minute purane auto-replies automatic delete."""
@@ -240,49 +289,59 @@ async def start_user(session_str):
     return True
 
 # ---------- handlers ----------
+OWNER_ONLY = {"login", "logout", "admins", "addadm"}
+
 async def on_cb(q):
     global user, temp
-    if q["from"]["id"] != OWNER_ID:
-        return await api("answerCallbackQuery", callback_query_id=q["id"])
-    d = q["data"]
+    uid = q["from"]["id"]
     cid = q["id"]
+    d = q["data"]
+    if not is_admin(uid):
+        return await api("answerCallbackQuery", callback_query_id=cid,
+                         text=sc("access denied - owner se connect karo"), show_alert=True)
+    if (d in OWNER_ONLY or d.startswith("rm:")) and not is_owner(uid):
+        return await api("answerCallbackQuery", callback_query_id=cid,
+                         text=sc("sirf owner ke liye"), show_alert=True)
+    data["menus"][str(uid)] = q["message"]["message_id"]
+    ans = lambda **k: api("answerCallbackQuery", callback_query_id=cid, **k)
+
     if d == "home":
-        state.clear()
-        if temp:
+        state.pop(uid, None)
+        if temp and is_owner(uid):
             await temp.disconnect(); temp = None
-        await api("answerCallbackQuery", callback_query_id=cid)
-        return await edit_home()
+        await ans()
+        return await edit_home(uid)
     if d == "toggle":
         if not user:
-            return await api("answerCallbackQuery", callback_query_id=cid,
-                             text=sc("pehle login karo!"), show_alert=True)
+            return await ans(text=sc("pehle owner login kare!"), show_alert=True)
         data["enabled"] = not data["enabled"]; save()
-        await api("answerCallbackQuery", callback_query_id=cid)
-        return await edit_home()
+        await ans()
+        return await edit_home(uid)
     if d == "setmsg":
-        state["step"] = "msg"
-        await api("answerCallbackQuery", callback_query_id=cid)
-        return await edit_menu(prompt(
+        state[uid] = {"step": "msg"}
+        await ans()
+        return await edit_menu(uid, prompt(
             f"✏️ {sc('naya auto-reply bhejo')}\n\n"
             f"• {sc('text, photo, video, sticker, gif, voice, file - sab chalega')}\n"
-            f"• {sc('bold/italic/link/spoiler formatting telegram se hi lagao')}\n"
-            f"• <code>{{name}}</code> = {sc('sender ka naam')}\n"
-            f"• {sc('media ke saath caption bhi likh sakte ho')}"), BACK)
+            f"• {sc('photo/video user ko spoiler (hide) me jayegi')}\n"
+            f"• {sc('bold/italic/link formatting telegram se hi lagao')}\n"
+            f"• <code>{{name}}</code> = {sc('sender ka naam')}"), BACK)
     if d == "preview":
-        await api("answerCallbackQuery", callback_query_id=cid)
-        return await send_preview()
+        await ans()
+        return await send_preview(uid)
     if d == "cd":
-        state["step"] = "cd"
-        await api("answerCallbackQuery", callback_query_id=cid)
-        return await edit_menu(prompt(f"⏱ {sc('ek bande ko dobara reply kitne ghante baad?')}\n"
-                                      f"{sc('example')} : <code>6</code> / <code>0.5</code>"), BACK)
+        state[uid] = {"step": "cd"}
+        await ans()
+        return await edit_menu(uid, prompt(
+            f"⏱ {sc('ek bande ko dobara reply kitne ghante baad?')}\n"
+            f"{sc('example')} : <code>6</code> / <code>0.5</code>\n"
+            f"<code>0</code> = {sc('har message par reply')}"), BACK)
     if d == "login":
         if user:
-            return await api("answerCallbackQuery", callback_query_id=cid,
-                             text=sc("already logged in"), show_alert=True)
-        state["step"] = "phone"
-        await api("answerCallbackQuery", callback_query_id=cid)
-        return await edit_menu(prompt(
+            return await ans(text=sc("already logged in"), show_alert=True)
+        state[uid] = {"step": "phone"}
+        await ans()
+        return await edit_menu(uid, prompt(
             f"📱 {sc('apna phone number bhejo (country code ke saath)')}\n"
             f"{sc('example')} : <code>+919876543210</code>\n\n"
             f"⚠️ {sc('sirf apna khud ka account use karo')}"), BACK)
@@ -294,33 +353,53 @@ async def on_cb(q):
                 pass
             user = None
         data["session"] = ""; data["enabled"] = False; data["pending"] = []; save()
-        await api("answerCallbackQuery", callback_query_id=cid, text=sc("logout ho gaya"), show_alert=True)
-        return await edit_home()
+        await ans(text=sc("logout ho gaya"), show_alert=True)
+        return await edit_home(uid)
+    if d == "admins":
+        await ans()
+        t, kb = admins_view()
+        return await edit_menu(uid, t, kb)
+    if d == "addadm":
+        state[uid] = {"step": "addadm"}
+        await ans()
+        return await edit_menu(uid, prompt(
+            f"➕ {sc('naye admin ki numeric telegram id bhejo')}\n"
+            f"{sc('(id @userinfobot se milti hai)')}\n\n"
+            f"{sc('us bande ko bot me /start karna hoga')}"), [[B("⬅️ Back", "admins", "primary")]])
+    if d.startswith("rm:"):
+        a = int(d[3:])
+        if a in data["admins"]:
+            data["admins"].remove(a); save()
+        await ans(text=sc("admin hata diya"))
+        t, kb = admins_view()
+        return await edit_menu(uid, t, kb)
 
-async def send_preview():
+async def send_preview(uid):
     text = data["message"].replace("{name}", "Rahul")
     m = data.get("media")
     ids = []
     if m:
+        k = m["kind"]
         method = {"photo": "sendPhoto", "video": "sendVideo", "animation": "sendAnimation",
                   "sticker": "sendSticker", "voice": "sendVoice", "audio": "sendAudio",
-                  "video_note": "sendVideoNote", "document": "sendDocument"}[m["kind"]]
-        field = method[4:].lower() if m["kind"] != "video_note" else "video_note"
-        p = {"chat_id": OWNER_ID, field: m["fid"]}
-        if m["kind"] not in ("sticker", "video_note") and text.strip():
+                  "video_note": "sendVideoNote", "document": "sendDocument"}[k]
+        p = {"chat_id": uid, k: m["fid"]}
+        if k in ("photo", "video", "animation"):
+            p["has_spoiler"] = True
+        if k not in ("sticker", "video_note") and text.strip():
             p.update(caption=text, parse_mode="HTML")
         r = await api(method, **p)
         if r: ids.append(r["message_id"])
-        if m["kind"] in ("sticker", "video_note") and text.strip():
-            r = await api("sendMessage", chat_id=OWNER_ID, text=text, parse_mode="HTML")
+        if k in ("sticker", "video_note") and text.strip():
+            r = await api("sendMessage", chat_id=uid, text=text, parse_mode="HTML")
             if r: ids.append(r["message_id"])
     else:
-        r = await api("sendMessage", chat_id=OWNER_ID, text=text or "—", parse_mode="HTML")
+        r = await api("sendMessage", chat_id=uid, text=text or "—", parse_mode="HTML")
         if r: ids.append(r["message_id"])
     async def later():
         await asyncio.sleep(20)
         for i in ids:
-            await api("deleteMessage", chat_id=OWNER_ID, message_id=i)
+            await api("deleteMessage", chat_id=uid, message_id=i)
     asyncio.create_task(later())
 
 async def set_reply(m):
@@ -355,66 +434,80 @@ async def set_reply(m):
     data["plain"] = plain
     save()
 
-async def finish_login():
+async def finish_login(uid):
     global temp
     data["session"] = temp.session.save(); save()
     await temp.disconnect(); temp = None
     ok = await start_user(data["session"])
-    state.clear()
-    await edit_home() if ok else await edit_menu(prompt("❌ " + sc("login fail")), BACK)
+    state.pop(uid, None)
+    if ok:
+        await edit_home(uid)
+    else:
+        await edit_menu(uid, prompt("❌ " + sc("login fail")), BACK)
 
 async def on_msg(m):
     global temp
-    if m["chat"]["id"] != OWNER_ID or m["from"]["id"] != OWNER_ID or m["chat"]["type"] != "private":
+    if m["chat"]["type"] != "private":
         return
+    uid = m["from"]["id"]
+    if not is_admin(uid):
+        return await send_unauth(uid)          # bina admin ke -> owner contact button
     txt = (m.get("text") or "").strip()
     mid = m["message_id"]
     if txt.startswith("/start"):
-        state.clear()
-        await api("deleteMessage", chat_id=OWNER_ID, message_id=mid)
-        return await send_menu()
-    step = state.get("step")
-    await_delete = True
+        state.pop(uid, None)
+        await api("deleteMessage", chat_id=uid, message_id=mid)
+        return await send_menu(uid)
+    step = state.get(uid, {}).get("step")
+    if not step:
+        return await api("deleteMessage", chat_id=uid, message_id=mid)
+    st = state[uid]
     try:
         if step == "msg":
             await set_reply(m)
-            state.clear()
-            await edit_home()
+            state.pop(uid, None)
+            await edit_home(uid)
         elif step == "cd":
-            data["cooldown"] = float(txt); save(); state.clear()
-            await edit_home()
-        elif step == "phone":
+            data["cooldown"] = float(txt); save(); state.pop(uid, None)
+            await edit_home(uid)
+        elif step == "addadm" and is_owner(uid):
+            a = int(txt)
+            if a != OWNER_ID and a not in data["admins"]:
+                data["admins"].append(a); save()
+            state.pop(uid, None)
+            t, kb = admins_view()
+            await edit_menu(uid, t, kb)
+        elif step == "phone" and is_owner(uid):
             temp = TelegramClient(StringSession(), API_ID, API_HASH)
             await temp.connect()
             sent = await temp.send_code_request(txt)
-            state.update(step="code", phone=txt, hash=sent.phone_code_hash)
-            await edit_menu(prompt(
+            st.update(step="code", phone=txt, hash=sent.phone_code_hash)
+            await edit_menu(uid, prompt(
                 f"📩 {sc('telegram ne otp bheja hai')}\n\n"
                 f"⚠️ {sc('otp spaces ke saath bhejo')} : <code>1 2 3 4 5</code>\n"
                 f"{sc('(warna telegram code expire kar deta hai)')}"), BACK)
-        elif step == "code":
+        elif step == "code" and is_owner(uid):
             code = "".join(ch for ch in txt if ch.isdigit())
             try:
-                await temp.sign_in(state["phone"], code, phone_code_hash=state["hash"])
+                await temp.sign_in(st["phone"], code, phone_code_hash=st["hash"])
             except SessionPasswordNeededError:
-                state["step"] = "2fa"
-                await edit_menu(prompt(f"🔐 {sc('2-step password bhejo')}"), BACK)
+                st["step"] = "2fa"
+                await edit_menu(uid, prompt(f"🔐 {sc('2-step password bhejo')}"), BACK)
             except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-                await edit_menu(prompt("❌ " + sc("otp galat ya expire. dobara bhejo")), BACK)
+                await edit_menu(uid, prompt("❌ " + sc("otp galat ya expire. dobara bhejo")), BACK)
             else:
-                await finish_login()
-        elif step == "2fa":
+                await finish_login(uid)
+        elif step == "2fa" and is_owner(uid):
             try:
                 await temp.sign_in(password=txt)
             except PasswordHashInvalidError:
-                await edit_menu(prompt("❌ " + sc("password galat. dobara bhejo")), BACK)
+                await edit_menu(uid, prompt("❌ " + sc("password galat. dobara bhejo")), BACK)
             else:
-                await finish_login()
+                await finish_login(uid)
     except Exception as e:
-        state.clear()
-        await edit_menu(prompt(f"⚠️ {sc('error')} : <code>{html.escape(str(e))[:300]}</code>"), BACK)
-    if await_delete:       # chat clean rakho (OTP/password turant delete)
-        await api("deleteMessage", chat_id=OWNER_ID, message_id=mid)
+        state.pop(uid, None)
+        await edit_menu(uid, prompt(f"⚠️ {sc('error')} : <code>{html.escape(str(e))[:300]}</code>"), BACK)
+    await api("deleteMessage", chat_id=uid, message_id=mid)    # OTP/password turant delete
 
 async def handle(u):
     try:
