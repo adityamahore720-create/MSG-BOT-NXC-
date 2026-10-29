@@ -24,7 +24,7 @@ FILE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 mimetypes.add_type("application/x-tgsticker", ".tgs")
 os.makedirs("media", exist_ok=True)
 
-DEFAULT = {"session": "", "enabled": False, "cooldown": 6.0,
+DEFAULT = {"session": "", "enabled": False, "cooldown": 24.0, "offline_only": True,
            "message": "👋 Hi {name}!\nMain abhi busy hu, jaldi reply karunga. 🙏",
            "plain": "👋 Hi {name}!\nMain abhi busy hu, jaldi reply karunga. 🙏",
            "media": None, "replied": {}, "pending": [], "menus": {}, "start_fid": "",
@@ -110,7 +110,9 @@ def home_kb(uid):
     kb = [
         [B("🟢 Auto-Reply : ON" if on else "🔴 Auto-Reply : OFF", "toggle", "success" if on else "danger")],
         [B("✏️ Set Reply", "setmsg", "primary"), B("👁 Preview", "preview", "primary")],
-        [B("⏱ Cooldown", "cd", "primary"), B("🔄 Refresh", "home", "primary")],
+        [B("📴 Offline Only : ON" if data["offline_only"] else "📴 Offline Only : OFF", "offonly",
+           "success" if data["offline_only"] else "danger")],
+        [B("🔁 Once Per User", "cd", "primary"), B("🔄 Refresh", "home", "primary")],
     ]
     if is_owner(uid):
         kb.append([B("🔑 Login", "login", "success"), B("🚪 Logout", "logout", "danger")])
@@ -128,7 +130,8 @@ def home_text():
             f"<i>{sc('auto reply manager')}</i>\n\n"
             f"👤 {sc('account')} : {acc}\n"
             f"⚡ {sc('auto reply')} : {on}\n"
-            f"⏱ {sc('cooldown')} : {data['cooldown']:g}{sc('h')}\n"
+            f"📴 {sc('only when offline')} : {'🟢 ᴏɴ' if data['offline_only'] else '🔴 ᴏꜰꜰ'}\n"
+            f"🔁 {sc('ek user ko dobara')} : {data['cooldown']:g}{sc('h baad')}\n"
             f"🎞 {sc('media')} : {media}\n\n"
             f"💬 {sc('message')} :\n<blockquote>{short}</blockquote>")
 
@@ -228,6 +231,7 @@ async def build_media_cache(m):
 
 async def send_reply(event, name):
     global media_cache
+    peer = await event.get_input_chat()
     text = data["message"].replace("{name}", html.escape(name))
     m = data.get("media")
     sent = []
@@ -238,7 +242,7 @@ async def send_reply(event, name):
         if media_cache is None:
             media_cache = await build_media_cache(m)
         try:
-            msg = await user.send_file(event.chat_id, media_cache, **args)
+            msg = await user.send_file(peer, media_cache, **args)
         except FloodWaitError:
             raise
         except Exception as e:
@@ -246,16 +250,38 @@ async def send_reply(event, name):
                 raise
             print("media cache rebuild:", e)           # file reference expire hua to dobara banao
             media_cache = await build_media_cache(m)
-            msg = await user.send_file(event.chat_id, media_cache, **args)
+            msg = await user.send_file(peer, media_cache, **args)
         sent.append(msg)
         if no_caption and text.strip():
-            sent.append(await user.send_message(event.chat_id, text, parse_mode="html"))
+            sent.append(await user.send_message(peer, text, parse_mode="html"))
     elif text.strip():
         sent.append(await event.reply(text, parse_mode="html"))
     due = time.time() + AUTO_DELETE
     for s in sent:
         data["pending"].append([event.chat_id, s.id, due])
     save()
+
+async def is_offline():
+    """Apna account abhi online hai ya offline (asli last-seen status)."""
+    try:
+        me = await user.get_me()
+        return not isinstance(me.status, tl.UserStatusOnline)
+    except Exception as e:
+        print("status check error:", e)
+        return True
+
+async def mark_offline():
+    try:
+        from telethon.tl.functions.account import UpdateStatusRequest
+        await user(UpdateStatusRequest(offline=True))
+    except Exception:
+        pass
+
+async def manual_reply_seen(event):
+    """Tumne khud kisi ko reply kiya -> us chat me auto-reply nahi jayega."""
+    if event.is_private and event.chat_id not in (me_id, 777000):
+        data["replied"][str(event.chat_id)] = time.time()
+        save()
 
 async def auto_reply(event):
     if not data["enabled"] or not event.is_private or event.out:
@@ -274,17 +300,23 @@ async def auto_reply(event):
         pass
     now = time.time()
     if now - data["replied"].get(str(sid), 0) < data["cooldown"] * 3600:
+        print("skip (already replied):", sid)
         return
+    if data["offline_only"] and not await is_offline():
+        print("skip (owner online):", sid)
+        return                               # tum online ho -> auto-reply nahi
     try:
         async with send_lock:
             await send_reply(event, name)
             await asyncio.sleep(1.5)         # thoda gap, taaki Telegram rate-limit na kare
         data["replied"][str(sid)] = now      # sirf success hone par cooldown lagta hai
         save()
+        print("replied:", sid)
+        await mark_offline()                 # reply bhejne se account "online" na dikhe
     except FloodWaitError as e:
         print(f"flood wait {e.seconds}s - is user ko baad me reply milega:", sid)
     except Exception as e:
-        print("reply error:", sid, e)
+        print("reply error:", sid, repr(e))
 
 async def cleaner():
     """5 minute purane auto-replies automatic delete."""
@@ -305,7 +337,7 @@ async def cleaner():
                 keep.append([chat, mid, due])
                 continue
             try:
-                await user.delete_messages(chat, [mid], revoke=True)
+                await user.delete_messages(None, [mid], revoke=True)   # private chat: entity ki zarurat nahi
             except Exception as e:
                 print("delete error:", e)
                 if now - due < 3600:             # 1 ghante tak dobara try
@@ -322,6 +354,7 @@ async def start_user(session_str):
         return False
     me_id = (await c.get_me()).id
     c.add_event_handler(auto_reply, events.NewMessage(incoming=True))
+    c.add_event_handler(manual_reply_seen, events.NewMessage(outgoing=True))
     user = c
     return True
 
@@ -363,6 +396,10 @@ async def on_cb(q):
             f"• {sc('photo/video user ko spoiler (hide) me jayegi')}\n"
             f"• {sc('bold/italic/link formatting telegram se hi lagao')}\n"
             f"• <code>{{name}}</code> = {sc('sender ka naam')}"), BACK)
+    if d == "offonly":
+        data["offline_only"] = not data["offline_only"]; save()
+        await ans()
+        return await edit_home(uid)
     if d == "preview":
         await ans()
         return await send_preview(uid)
@@ -370,8 +407,8 @@ async def on_cb(q):
         state[uid] = {"step": "cd"}
         await ans()
         return await edit_menu(uid, prompt(
-            f"⏱ {sc('ek bande ko dobara reply kitne ghante baad?')}\n"
-            f"{sc('example')} : <code>6</code> / <code>0.5</code>\n"
+            f"🔁 {sc('ek bande ko ek hi baar reply jayega. dobara kitne ghante baad?')}\n"
+            f"{sc('example')} : <code>24</code> ({sc('default')}) / <code>168</code> ({sc('7 din')})\n"
             f"<code>0</code> = {sc('har message par reply')}"), BACK)
     if d == "login":
         if user:
